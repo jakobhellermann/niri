@@ -75,6 +75,8 @@ pub struct WindowRule {
     pub scroll_factor: Option<FloatOrInt<0, 100>>,
     #[knuffel(child, unwrap(argument))]
     pub tiled_state: Option<bool>,
+    #[knuffel(child, unwrap(argument))]
+    pub disable_mod_mouse_actions: Option<bool>,
     #[knuffel(child, default)]
     pub background_effect: BackgroundEffectRule,
     #[knuffel(child, default)]
@@ -135,6 +137,8 @@ pub struct Match {
     pub is_window_cast_target: Option<bool>,
     #[knuffel(property)]
     pub is_urgent: Option<bool>,
+    #[knuffel(property)]
+    pub is_fullscreen: Option<bool>,
     #[knuffel(property)]
     pub at_startup: Option<bool>,
 }

@@ -1250,6 +1250,7 @@ mod tests {
 
             output "eDP-2" {
                 mode custom=true "1920x1080@144"
+                global-workspace-index-base 5
             }
 
             output "eDP-3" {
@@ -1380,6 +1381,7 @@ mod tests {
                 open-fullscreen false
                 open-floating false
                 open-focused true
+                disable-mod-mouse-actions true
                 default-window-height { fixed 500; }
                 default-column-display "tabbed"
                 default-floating-position x=100 y=-200 relative-to="bottom-left"
@@ -1712,6 +1714,7 @@ mod tests {
                             },
                         ),
                         layout: None,
+                        global_workspace_index_base: None,
                     },
                     Output {
                         off: false,
@@ -1739,6 +1742,9 @@ mod tests {
                         backdrop_color: None,
                         hot_corners: None,
                         layout: None,
+                        global_workspace_index_base: Some(
+                            5,
+                        ),
                     },
                     Output {
                         off: false,
@@ -1769,6 +1775,7 @@ mod tests {
                         backdrop_color: None,
                         hot_corners: None,
                         layout: None,
+                        global_workspace_index_base: None,
                     },
                 ],
             ),
@@ -1967,6 +1974,7 @@ mod tests {
                 center_focused_column: OnOverflow,
                 always_center_single_column: false,
                 empty_workspace_above_first: false,
+                global_workspace_indices: false,
                 default_column_display: Tabbed,
                 gaps: 8.0,
                 struts: Struts {
@@ -2423,6 +2431,9 @@ mod tests {
                         ),
                     ),
                     tiled_state: None,
+                    disable_mod_mouse_actions: Some(
+                        true,
+                    ),
                     background_effect: BackgroundEffectRule {
                         xray: None,
                         blur: None,

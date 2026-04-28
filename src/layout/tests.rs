@@ -1773,6 +1773,16 @@ fn check_ops_with_options(
     layout
 }
 
+fn options_with_global_workspace_indices() -> Options {
+    Options {
+        layout: niri_config::Layout {
+            global_workspace_indices: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 #[test]
 fn operations_dont_panic() {
     if std::env::var_os("RUN_SLOW_TESTS").is_none() {
@@ -2396,6 +2406,659 @@ fn move_workspace_to_output() {
     assert_eq!(monitors[1].active_workspace_idx, 0);
     assert_eq!(monitors[1].workspaces.len(), 2);
     assert!(monitors[1].workspaces[0].has_windows());
+}
+
+#[test]
+fn global_workspace_indices_assign_unique_active_indices_per_output() {
+    let ops = [Op::AddOutput(1), Op::AddOutput(2)];
+
+    let layout = check_ops_with_options(options_with_global_workspace_indices(), ops);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[0].workspaces[monitors[0].active_workspace_idx].id(),
+            monitors[0].active_workspace_idx
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[1].workspaces[monitors[1].active_workspace_idx].id(),
+            monitors[1].active_workspace_idx
+        ),
+        Some(2)
+    );
+}
+
+#[test]
+fn global_workspace_indices_respect_configured_base() {
+    // output1 has base 1 (default-ish); output2 has base 5. With this configuration
+    // we expect output1 active=1 and output2 active=5, plus workspace-down on output2
+    // creating a workspace at index 6.
+    let mut layout = Layout::<TestWindow>::with_options(
+        Clock::with_time(Duration::ZERO),
+        options_with_global_workspace_indices(),
+    );
+    layout.set_global_workspace_index_base("output1", Some(1));
+    layout.set_global_workspace_index_base("output2", Some(5));
+    Op::AddOutput(1).apply(&mut layout);
+    Op::AddOutput(2).apply(&mut layout);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let by_name = |name: &str| monitors.iter().find(|m| m.output_name() == name).unwrap();
+    let out1 = by_name("output1");
+    let out2 = by_name("output2");
+
+    assert_eq!(
+        layout.workspace_display_idx(
+            out1.workspaces[out1.active_workspace_idx].id(),
+            out1.active_workspace_idx
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        layout.workspace_display_idx(
+            out2.workspaces[out2.active_workspace_idx].id(),
+            out2.active_workspace_idx
+        ),
+        Some(5)
+    );
+
+    // Now focus output2 and move workspace-down: should land on global index 6.
+    let out2_output = out2.output().clone();
+    layout.focus_output(&out2_output);
+    let next = layout
+        .next_global_workspace_index_on_output_for_move(&out2_output)
+        .unwrap();
+    assert_eq!(next, 6);
+}
+
+#[test]
+fn global_workspace_indices_resolve_and_move_across_outputs() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddOutput(2),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+    ];
+
+    let mut layout = check_ops_with_options(options_with_global_workspace_indices(), ops);
+
+    let (output, index) = layout
+        .find_output_and_workspace_index(WorkspaceReference::Index(2))
+        .unwrap();
+    let output = output.unwrap();
+    assert_eq!(output.name(), "output2");
+    assert_eq!(index, 0);
+
+    layout.move_to_output(None, &output, Some(index), ActivateWindow::Smart);
+
+    let MonitorSet::Normal {
+        monitors,
+        active_monitor_idx,
+        ..
+    } = &layout.monitor_set
+    else {
+        unreachable!()
+    };
+
+    assert_eq!(*active_monitor_idx, 1);
+    assert!(monitors[1].workspaces[monitors[1].active_workspace_idx].has_window(&1));
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[1].workspaces[monitors[1].active_workspace_idx].id(),
+            monitors[1].active_workspace_idx
+        ),
+        Some(2)
+    );
+}
+
+#[test]
+fn global_workspace_indices_keep_empty_active_workspace_index_on_other_output() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddOutput(2),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+    ];
+
+    let mut layout = check_ops_with_options(options_with_global_workspace_indices(), ops);
+
+    let (output, index) = layout
+        .find_output_and_workspace_index(WorkspaceReference::Index(2))
+        .unwrap();
+    let output = output.unwrap();
+    layout.move_to_output(None, &output, Some(index), ActivateWindow::Smart);
+    layout.remove_window(&1, Transaction::new());
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[0].workspaces[monitors[0].active_workspace_idx].id(),
+            monitors[0].active_workspace_idx
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[1].workspaces[monitors[1].active_workspace_idx].id(),
+            monitors[1].active_workspace_idx
+        ),
+        Some(2)
+    );
+}
+
+#[test]
+fn global_workspace_indices_stay_unique_when_workspace_gains_a_window() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddOutput(2),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+    ];
+
+    let mut layout = check_ops_with_options(options_with_global_workspace_indices(), ops);
+
+    let (output, index) = layout
+        .find_output_and_workspace_index(WorkspaceReference::Index(2))
+        .unwrap();
+    let output = output.unwrap();
+    layout.move_to_output(None, &output, Some(index), ActivateWindow::Smart);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+
+    let mut indices = monitors
+        .iter()
+        .flat_map(|mon| {
+            mon.workspaces
+                .iter()
+                .enumerate()
+                .filter_map(|(ws_idx, ws)| layout.workspace_display_idx(ws.id(), ws_idx))
+        })
+        .collect::<Vec<_>>();
+    indices.sort_unstable();
+    indices.dedup();
+
+    assert_eq!(indices, vec![1, 2]);
+}
+
+#[test]
+fn global_workspace_indices_keep_switched_active_workspace_number() {
+    let ops = [Op::AddOutput(1), Op::AddOutput(2)];
+
+    let mut layout = check_ops_with_options(options_with_global_workspace_indices(), ops);
+
+    let (output, index) = layout
+        .find_output_and_workspace_index(WorkspaceReference::Index(3))
+        .unwrap();
+    let output = output.unwrap();
+    layout.focus_output(&output);
+    layout.switch_workspace(index);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[0].workspaces[monitors[0].active_workspace_idx].id(),
+            monitors[0].active_workspace_idx
+        ),
+        Some(3)
+    );
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[1].workspaces[monitors[1].active_workspace_idx].id(),
+            monitors[1].active_workspace_idx
+        ),
+        Some(2)
+    );
+}
+
+#[test]
+fn global_workspace_indices_recreate_released_workspace_on_active_monitor() {
+    let ops = [Op::AddOutput(1), Op::AddOutput(2)];
+
+    let mut layout = check_ops_with_options(options_with_global_workspace_indices(), ops);
+
+    let (output, index) = layout
+        .find_output_and_workspace_index(WorkspaceReference::Index(3))
+        .unwrap();
+    let output = output.unwrap();
+    layout.focus_output(&output);
+    layout.switch_workspace(index);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let output2 = monitors[1].output.clone();
+
+    layout.focus_output(&output2);
+    let (output, index) = layout
+        .find_output_and_workspace_index(WorkspaceReference::Index(1))
+        .unwrap();
+    assert_eq!(output.as_ref(), Some(&output2));
+    layout.switch_workspace(index);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[1].workspaces[monitors[1].active_workspace_idx].id(),
+            monitors[1].active_workspace_idx
+        ),
+        Some(1)
+    );
+}
+
+#[test]
+fn global_workspace_indices_workspace_down_creates_next_free_number() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddOutput(2),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+    ];
+
+    let mut layout = check_ops_with_options(options_with_global_workspace_indices(), ops);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let output1 = monitors[0].output.clone();
+
+    layout.focus_output(&output1);
+    layout.switch_workspace_down();
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[0].workspaces[monitors[0].active_workspace_idx].id(),
+            monitors[0].active_workspace_idx
+        ),
+        Some(3)
+    );
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[1].workspaces[monitors[1].active_workspace_idx].id(),
+            monitors[1].active_workspace_idx
+        ),
+        Some(2)
+    );
+}
+
+#[test]
+fn global_workspace_indices_focus_window_or_workspace_down_prefers_window_focus() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddOutput(2),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+        Op::AddWindow {
+            params: TestWindowParams::new(2),
+        },
+    ];
+
+    let mut layout = check_ops_with_options(options_with_global_workspace_indices(), ops);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let output2 = monitors[1].output.clone();
+
+    layout.focus_output(&output2);
+    layout.focus_window_or_workspace_down();
+
+    let MonitorSet::Normal {
+        monitors,
+        active_monitor_idx,
+        ..
+    } = &layout.monitor_set
+    else {
+        unreachable!()
+    };
+
+    assert_eq!(*active_monitor_idx, 1);
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[1].workspaces[monitors[1].active_workspace_idx].id(),
+            monitors[1].active_workspace_idx
+        ),
+        Some(2)
+    );
+}
+
+#[test]
+fn global_workspace_indices_empty_workspace_down_does_not_create_new_workspace() {
+    let ops = [Op::AddOutput(1), Op::AddOutput(2)];
+
+    let mut layout = check_ops_with_options(options_with_global_workspace_indices(), ops);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let output2 = monitors[1].output.clone();
+
+    layout.focus_output(&output2);
+    layout.switch_workspace_down();
+
+    let win = TestWindow::new(TestWindowParams::new(1));
+    layout.add_window(
+        win,
+        AddWindowTarget::Auto,
+        None,
+        None,
+        false,
+        false,
+        ActivateWindow::default(),
+    );
+    layout.remove_window(&1, Transaction::new());
+    layout.focus_window_or_workspace_down();
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[1].workspaces[monitors[1].active_workspace_idx].id(),
+            monitors[1].active_workspace_idx
+        ),
+        Some(2)
+    );
+}
+
+#[test]
+fn global_workspace_indices_move_column_down_creates_next_free_number() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddOutput(2),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+    ];
+
+    let mut layout = check_ops_with_options(options_with_global_workspace_indices(), ops);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let output1 = monitors[0].output.clone();
+
+    layout.focus_output(&output1);
+    layout.move_column_to_workspace_down(true);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[0].workspaces[monitors[0].active_workspace_idx].id(),
+            monitors[0].active_workspace_idx
+        ),
+        Some(3)
+    );
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[1].workspaces[monitors[1].active_workspace_idx].id(),
+            monitors[1].active_workspace_idx
+        ),
+        Some(2)
+    );
+    assert!(monitors[0].workspaces[monitors[0].active_workspace_idx].has_window(&1));
+}
+
+#[test]
+fn global_workspace_indices_move_window_down_creates_next_free_number() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddOutput(2),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+    ];
+
+    let mut layout = check_ops_with_options(options_with_global_workspace_indices(), ops);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let output1 = monitors[0].output.clone();
+
+    layout.focus_output(&output1);
+    layout.move_to_workspace_down(true);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[0].workspaces[monitors[0].active_workspace_idx].id(),
+            monitors[0].active_workspace_idx
+        ),
+        Some(3)
+    );
+    assert!(monitors[0].workspaces[monitors[0].active_workspace_idx].has_window(&1));
+}
+
+#[test]
+fn global_workspace_indices_move_window_up_returns_to_previous_existing_number() {
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddOutput(2),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+    ];
+
+    let mut layout = check_ops_with_options(options_with_global_workspace_indices(), ops);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let output1 = monitors[0].output.clone();
+
+    layout.focus_output(&output1);
+    layout.move_to_workspace_down(true);
+    layout.move_to_workspace_up(true);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[0].workspaces[monitors[0].active_workspace_idx].id(),
+            monitors[0].active_workspace_idx
+        ),
+        Some(1)
+    );
+    assert!(monitors[0].workspaces[monitors[0].active_workspace_idx].has_window(&1));
+}
+
+#[test]
+fn global_workspace_indices_move_workspace_down_reassigns_active_workspace_number() {
+    let ops = [Op::AddOutput(1), Op::AddOutput(2)];
+
+    let mut layout = check_ops_with_options(options_with_global_workspace_indices(), ops);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let output1 = monitors[0].output.clone();
+
+    layout.focus_output(&output1);
+    layout.move_workspace_down();
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[0].workspaces[monitors[0].active_workspace_idx].id(),
+            monitors[0].active_workspace_idx
+        ),
+        Some(3)
+    );
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[1].workspaces[monitors[1].active_workspace_idx].id(),
+            monitors[1].active_workspace_idx
+        ),
+        Some(2)
+    );
+}
+
+#[test]
+fn global_workspace_indices_move_workspace_up_recreates_released_lower_number() {
+    let ops = [Op::AddOutput(1), Op::AddOutput(2)];
+
+    let mut layout = check_ops_with_options(options_with_global_workspace_indices(), ops);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let output1 = monitors[0].output.clone();
+
+    layout.focus_output(&output1);
+    layout.move_workspace_down();
+    layout.move_workspace_up();
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[0].workspaces[monitors[0].active_workspace_idx].id(),
+            monitors[0].active_workspace_idx
+        ),
+        Some(1)
+    );
+}
+
+#[test]
+fn global_workspace_indices_workspace_previous_stays_on_current_output() {
+    let ops = [Op::AddOutput(1), Op::AddOutput(2)];
+
+    let mut layout = check_ops_with_options(options_with_global_workspace_indices(), ops);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let output1 = monitors[0].output.clone();
+
+    layout.focus_output(&output1);
+    layout.switch_workspace_down();
+    layout.switch_workspace_previous();
+
+    let MonitorSet::Normal {
+        monitors,
+        active_monitor_idx,
+        ..
+    } = &layout.monitor_set
+    else {
+        unreachable!()
+    };
+
+    assert_eq!(*active_monitor_idx, 0);
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[0].workspaces[monitors[0].active_workspace_idx].id(),
+            monitors[0].active_workspace_idx
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        layout.workspace_display_idx(
+            monitors[1].workspaces[monitors[1].active_workspace_idx].id(),
+            monitors[1].active_workspace_idx
+        ),
+        Some(2)
+    );
+}
+
+#[test]
+fn global_workspace_indices_focus_lower_index_inserts_above() {
+    // Regression for the move-window-to-workspace-5-while-on-#7 bug. Under Invariant A,
+    // requesting a global index lower than what currently exists on the monitor must
+    // insert the new workspace *above* the existing one physically — not just append at
+    // the bottom.
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+    ];
+
+    let mut layout = check_ops_with_options(options_with_global_workspace_indices(), ops);
+
+    // Focus-workspace 7 to create a workspace numbered 7 with the window.
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let output = monitors[0].output.clone();
+    let (out, idx) = layout
+        .find_output_and_workspace_index(WorkspaceReference::Index(7))
+        .unwrap();
+    assert_eq!(out.as_ref(), Some(&output));
+    layout.switch_workspace(idx);
+    // Move the window to #7 (which is now the active workspace; window is on #1).
+    // Easiest path: just request the move via Layout::move_to_workspace at the resolved idx.
+    let (_, idx_for_window) = layout
+        .find_output_and_workspace_index(WorkspaceReference::Index(7))
+        .unwrap();
+    layout.move_to_workspace(Some(&1), idx_for_window, ActivateWindow::Yes);
+
+    // Sanity: #7 now exists and holds the window.
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let mon = &monitors[0];
+    let seven_pos = mon
+        .workspaces
+        .iter()
+        .position(|ws| layout.workspace_display_idx(ws.id(), 0) == Some(7))
+        .expect("#7 must exist");
+    assert!(mon.workspaces[seven_pos].has_window(&1));
+
+    // Now request a lower global index #5. With the bug, this would append #5 *below*
+    // #7. With the fix, #5 must be inserted physically above #7.
+    let (_, five_idx) = layout
+        .find_output_and_workspace_index(WorkspaceReference::Index(5))
+        .unwrap();
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let mon = &monitors[0];
+    let five_id = mon.workspaces[five_idx].id();
+    assert_eq!(layout.workspace_display_idx(five_id, five_idx), Some(5));
+
+    // Invariant A: indexed workspaces appear in ascending order top-to-bottom.
+    let order: Vec<usize> = mon
+        .workspaces
+        .iter()
+        .enumerate()
+        .filter_map(|(i, ws)| layout.workspace_display_idx(ws.id(), i))
+        .collect();
+    assert_eq!(order, vec![5, 7]);
 }
 
 #[test]
@@ -4042,6 +4705,24 @@ proptest! {
         // eprintln!("{ops:?}");
         let options = Options {
             layout: niri_config::Layout::from_part(&layout_config),
+            ..Default::default()
+        };
+
+        check_ops_with_options(options, ops);
+    }
+
+    /// Same as `random_operations_dont_panic` but with `global-workspace-indices` enabled
+    /// throughout the run. `Layout::verify_invariants` enforces Invariant A and the global
+    /// index uniqueness/eligibility rules after every Op.
+    #[test]
+    fn random_operations_dont_panic_with_global_workspace_indices(
+        ops: Vec<Op>,
+        layout_config in arbitrary_layout_part(),
+    ) {
+        let mut layout = niri_config::Layout::from_part(&layout_config);
+        layout.global_workspace_indices = true;
+        let options = Options {
+            layout,
             ..Default::default()
         };
 

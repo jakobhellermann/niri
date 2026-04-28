@@ -31,7 +31,7 @@
 //! workspace just like any other. Then they come back, reconnect the second monitor, and now we
 //! don't want an unassuming workspace to end up on it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::rc::Rc;
 use std::time::Duration;
@@ -356,6 +356,12 @@ pub struct Layout<W: LayoutElement> {
     /// The workspace id does not necessarily point to a valid workspace. If it doesn't, then it is
     /// simply ignored.
     last_active_workspace_id: HashMap<String, WorkspaceId>,
+    /// Optional global workspace indices for workspaces when the feature is enabled.
+    global_workspace_idxs: HashMap<WorkspaceId, usize>,
+    /// Per-output preferred starting index for global workspace indices, keyed by output
+    /// connector name. Empty unless `global-workspace-indices` is enabled and the user has
+    /// configured `global-workspace-index-base` on at least one output.
+    global_workspace_index_bases: HashMap<String, usize>,
     /// Ongoing interactive move.
     interactive_move: Option<InteractiveMoveState<W>>,
     /// Ongoing drag-and-drop operation.
@@ -713,6 +719,512 @@ impl RenderLayer {
 }
 
 impl<W: LayoutElement> Layout<W> {
+    fn global_workspace_indices_enabled(&self) -> bool {
+        self.options.layout.global_workspace_indices
+    }
+
+    /// Sets the configured `global-workspace-index-base` for a single output. Pass `None` to
+    /// clear it.
+    pub fn set_global_workspace_index_base(&mut self, output_name: &str, base: Option<usize>) {
+        match base {
+            Some(base) => {
+                if base == 0 {
+                    warn!(
+                        "global-workspace-index-base on output {output_name} is 0; \
+                         using auto-assignment instead. Indices start at 1."
+                    );
+                    self.global_workspace_index_bases.remove(output_name);
+                    return;
+                }
+                if let Some((other, _)) = self
+                    .global_workspace_index_bases
+                    .iter()
+                    .find(|(other, b)| *other != output_name && **b == base)
+                {
+                    warn!(
+                        "global-workspace-index-base {base} on output {output_name} conflicts \
+                         with output {other}; the second to refresh will fall through to the \
+                         next free index"
+                    );
+                }
+                self.global_workspace_index_bases
+                    .insert(output_name.to_owned(), base);
+            }
+            None => {
+                self.global_workspace_index_bases.remove(output_name);
+            }
+        }
+    }
+
+    fn next_free_global_workspace_index_from(&self, start: usize) -> usize {
+        let used: HashSet<_> = self.global_workspace_idxs.values().copied().collect();
+
+        (start.max(1)..)
+            .find(|candidate| !used.contains(candidate))
+            .expect("there must always be a free global workspace index")
+    }
+
+    /// Picks a global index for a workspace that doesn't yet have one. Uses `preferred` if it
+    /// is free and would be >= the current max on this monitor (so it doesn't violate
+    /// Invariant A on insertion). Otherwise picks the smallest free integer that is also
+    /// greater than the highest existing index on `output_name` (or 1 if the monitor is
+    /// empty). This guarantees the new number sorts to the bottom of its monitor without
+    /// reordering anything else.
+    fn pick_fresh_global_workspace_index(
+        &self,
+        output_name: Option<&str>,
+        preferred: Option<usize>,
+    ) -> usize {
+        let used: HashSet<usize> = self.global_workspace_idxs.values().copied().collect();
+        let max_on_monitor = output_name
+            .and_then(|n| self.max_global_index_on_output(n))
+            .unwrap_or(0);
+
+        if let Some(p) = preferred.filter(|p| *p > 0 && *p > max_on_monitor && !used.contains(p)) {
+            return p;
+        }
+
+        ((max_on_monitor + 1).max(1)..)
+            .find(|c| !used.contains(c))
+            .expect("there must always be a free global workspace index")
+    }
+
+    fn max_global_index_on_output(&self, output_name: &str) -> Option<usize> {
+        let MonitorSet::Normal { monitors, .. } = &self.monitor_set else {
+            return None;
+        };
+        let monitor = monitors.iter().find(|m| m.output_name() == output_name)?;
+        monitor
+            .workspaces
+            .iter()
+            .filter_map(|ws| self.global_workspace_idxs.get(&ws.id()).copied())
+            .max()
+    }
+
+    fn refresh_global_workspace_indices(&mut self) {
+        if !self.global_workspace_indices_enabled() {
+            self.global_workspace_idxs.clear();
+            return;
+        }
+
+        // Pre-pass: clean up empty unnamed inactive workspaces *before* we look at
+        // eligibility. clean_up_workspaces can remove or relocate workspaces (notably the
+        // empty_workspace_above_first 2-empty special case), which changes which
+        // workspaces are eligible and where they sit. Doing it first keeps the rest of
+        // the passes consistent. Skip monitors with an in-flight switch.
+        if let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set {
+            for mon in monitors {
+                if mon.workspace_switch.is_some() {
+                    continue;
+                }
+                mon.clean_up_workspaces();
+            }
+        }
+
+        // First pass: drop indices for workspaces that are no longer eligible, and collect
+        // workspaces that need fresh indices.
+        let old_indices = mem::take(&mut self.global_workspace_idxs);
+        let mut to_assign: Vec<(WorkspaceId, Option<String>, Option<usize>)> = Vec::new();
+
+        match &self.monitor_set {
+            MonitorSet::Normal { monitors, .. } => {
+                for (mon_idx, mon) in monitors.iter().enumerate() {
+                    let preferred_active = self
+                        .global_workspace_index_bases
+                        .get(mon.output_name())
+                        .copied()
+                        .unwrap_or(mon_idx + 1);
+                    for (ws_idx, ws) in mon.workspaces.iter().enumerate() {
+                        let eligible =
+                            ws.has_windows_or_name() || ws_idx == mon.active_workspace_idx;
+                        if !eligible {
+                            continue;
+                        }
+                        if let Some(index) = old_indices.get(&ws.id()).copied() {
+                            self.global_workspace_idxs.insert(ws.id(), index);
+                        } else {
+                            let preferred =
+                                (ws_idx == mon.active_workspace_idx).then_some(preferred_active);
+                            to_assign.push((ws.id(), Some(mon.output_name().clone()), preferred));
+                        }
+                    }
+                }
+            }
+            MonitorSet::NoOutputs { workspaces } => {
+                for ws in workspaces {
+                    if !ws.has_windows_or_name() {
+                        continue;
+                    }
+                    if let Some(index) = old_indices.get(&ws.id()).copied() {
+                        self.global_workspace_idxs.insert(ws.id(), index);
+                    } else {
+                        to_assign.push((ws.id(), None, None));
+                    }
+                }
+            }
+        }
+
+        // Second pass: assign fresh indices. We do this after the reassignment pass so
+        // pick_fresh_global_workspace_index sees the already-stable indices when computing
+        // max_global_index_on_output.
+        for (id, output_name, preferred) in to_assign {
+            let index = self.pick_fresh_global_workspace_index(output_name.as_deref(), preferred);
+            self.global_workspace_idxs.insert(id, index);
+        }
+
+        // Third pass: enforce Invariant A within each monitor. Walk physical order; if
+        // an indexed workspace's number isn't strictly greater than the previous one,
+        // bump it up to the smallest free integer that is. This handles cases like a
+        // newly-named workspace appearing above the trailing-active workspace, which
+        // would otherwise leave a lower index physically below a higher one. We renumber
+        // *during* this pass rather than swapping so we never introduce a duplicate.
+        let mut used: HashSet<usize> = self.global_workspace_idxs.values().copied().collect();
+        if let MonitorSet::Normal { monitors, .. } = &self.monitor_set {
+            let mut fixups: Vec<(WorkspaceId, usize)> = Vec::new();
+            for mon in monitors {
+                let mut prev: usize = 0;
+                for ws in &mon.workspaces {
+                    let Some(&idx) = self.global_workspace_idxs.get(&ws.id()) else {
+                        continue;
+                    };
+                    let new_idx = if idx > prev {
+                        idx
+                    } else {
+                        used.remove(&idx);
+                        let candidate = (prev + 1..)
+                            .find(|c| !used.contains(c))
+                            .expect("free index must exist");
+                        used.insert(candidate);
+                        fixups.push((ws.id(), candidate));
+                        candidate
+                    };
+                    prev = new_idx;
+                }
+            }
+            for (id, idx) in fixups {
+                self.global_workspace_idxs.insert(id, idx);
+            }
+        }
+
+        // Fourth pass: re-sort each monitor's workspaces by global index. Skip monitors
+        // with an in-flight workspace switch — they'll be re-sorted on the next refresh
+        // after the animation finishes.
+        let indices = self.global_workspace_idxs.clone();
+        if let MonitorSet::Normal { monitors, .. } = &mut self.monitor_set {
+            for mon in monitors {
+                if mon.workspace_switch.is_some() {
+                    continue;
+                }
+                mon.sort_workspaces_by_global_index(&indices);
+            }
+        }
+    }
+
+    fn find_workspace_by_global_index(
+        &self,
+        index: usize,
+    ) -> Option<(Option<Output>, usize, WorkspaceId)> {
+        let id = self
+            .global_workspace_idxs
+            .iter()
+            .find_map(|(id, candidate)| (*candidate == index).then_some(*id))?;
+        let (workspace_idx, workspace) = self.find_workspace_by_id(id)?;
+        Some((workspace.current_output().cloned(), workspace_idx, id))
+    }
+
+    fn ensure_global_workspace_by_index(
+        &mut self,
+        index: usize,
+    ) -> Option<(Option<Output>, usize)> {
+        self.refresh_global_workspace_indices();
+
+        if let Some((output, workspace_idx, _)) = self.find_workspace_by_global_index(index) {
+            return Some((output, workspace_idx));
+        }
+
+        let output = match &self.monitor_set {
+            MonitorSet::Normal {
+                monitors,
+                active_monitor_idx,
+                ..
+            } => monitors[*active_monitor_idx].output.clone(),
+            MonitorSet::NoOutputs { .. } => {
+                let target_idx = self.create_workspace_for_global_index_no_outputs(index);
+                return Some((None, target_idx));
+            }
+        };
+        let target_idx = self.create_workspace_for_global_index_on_output(&output, index)?;
+        Some((Some(output), target_idx))
+    }
+
+    fn ensure_global_workspace_by_index_on_output(
+        &mut self,
+        output: &Output,
+        index: usize,
+    ) -> Option<usize> {
+        self.refresh_global_workspace_indices();
+
+        if let Some((existing_output, workspace_idx, _)) =
+            self.find_workspace_by_global_index(index)
+        {
+            return (existing_output.as_ref() == Some(output)).then_some(workspace_idx);
+        }
+
+        self.create_workspace_for_global_index_on_output(output, index)
+    }
+
+    /// Creates a workspace on `output` with global index `index`, in the physical position
+    /// that satisfies Invariant A (above the first existing indexed workspace with a number
+    /// > `index`, else at the bottom). Records the index in `global_workspace_idxs`.
+    /// Returns the new workspace's vec index.
+    ///
+    /// If the natural insertion position is at the trailing-empty slot and that slot is an
+    /// unindexed empty workspace, the function claims it and adds a fresh trailing empty
+    /// below. Otherwise it inserts a new workspace at the physically-correct middle slot
+    /// (bypassing `Monitor::clean_up_workspaces`, which would otherwise immediately
+    /// garbage-collect a freshly-inserted empty workspace).
+    fn create_workspace_for_global_index_on_output(
+        &mut self,
+        output: &Output,
+        index: usize,
+    ) -> Option<usize> {
+        // Walk the monitor's workspaces and find the first one whose global index is
+        // greater than `index` — that's where the new workspace must go to satisfy
+        // Invariant A. If none is found, default to the trailing-empty slot.
+        let monitor = self.monitor_for_output(output)?;
+        let tail_idx = monitor.workspaces.len() - 1;
+        let mut insert_at = tail_idx;
+        for (ws_idx, ws) in monitor.workspaces.iter().enumerate() {
+            if let Some(existing) = self.global_workspace_idxs.get(&ws.id()).copied() {
+                if existing > index {
+                    insert_at = ws_idx;
+                    break;
+                }
+            }
+        }
+
+        let tail_id = monitor.workspaces[tail_idx].id();
+        let tail_is_eligible_empty = !monitor.workspaces[tail_idx].has_windows_or_name()
+            && !self.global_workspace_idxs.contains_key(&tail_id);
+
+        if insert_at >= tail_idx && tail_is_eligible_empty {
+            // Claim the existing trailing empty as our new indexed workspace, then add a
+            // fresh trailing empty below it.
+            self.global_workspace_idxs.insert(tail_id, index);
+            let monitor = self.monitor_for_output_mut(output)?;
+            monitor.add_workspace_bottom();
+            return Some(tail_idx);
+        }
+
+        // Middle insertion: build the new workspace and splice it in without invoking
+        // `clean_up_workspaces` (which would remove a freshly-inserted empty workspace
+        // before we have a chance to do anything with it). We replicate the prelude of
+        // `Monitor::insert_workspace` — set the output and synchronize the workspace's
+        // base options to the monitor's options — but skip the cleanup.
+        let mut new_ws = {
+            let monitor = self.monitor_for_output(output)?;
+            Workspace::new(
+                output.clone(),
+                monitor.clock.clone(),
+                monitor.base_options.clone(),
+            )
+        };
+        let new_id = new_ws.id();
+
+        let monitor = self.monitor_for_output_mut(output)?;
+        new_ws.set_output(Some(monitor.output.clone()));
+        new_ws.update_config(monitor.options.clone());
+
+        monitor.workspaces.insert(insert_at, new_ws);
+        if insert_at <= monitor.active_workspace_idx {
+            monitor.active_workspace_idx += 1;
+        }
+        monitor.workspace_switch = None;
+        self.global_workspace_idxs.insert(new_id, index);
+
+        let monitor = self.monitor_for_output(output)?;
+        monitor.workspaces.iter().position(|ws| ws.id() == new_id)
+    }
+
+    fn create_workspace_for_global_index_no_outputs(&mut self, index: usize) -> usize {
+        let MonitorSet::NoOutputs { workspaces } = &mut self.monitor_set else {
+            unreachable!("called create_workspace_for_global_index_no_outputs without NoOutputs")
+        };
+
+        // Find the first position whose indexed workspace has number > index; insert there.
+        let indices = &self.global_workspace_idxs;
+        let mut insert_at = workspaces.len();
+        for (ws_idx, ws) in workspaces.iter().enumerate() {
+            if let Some(existing) = indices.get(&ws.id()).copied() {
+                if existing > index {
+                    insert_at = ws_idx;
+                    break;
+                }
+            }
+        }
+
+        let ws = Workspace::new_no_outputs(self.clock.clone(), self.options.clone());
+        let id = ws.id();
+        workspaces.insert(insert_at, ws);
+        self.global_workspace_idxs.insert(id, index);
+
+        insert_at
+    }
+
+    fn workspace_global_index_on_output(&mut self, output: &Output) -> Option<usize> {
+        self.refresh_global_workspace_indices();
+
+        let monitor = self.monitor_for_output(output)?;
+        let active_workspace = &monitor.workspaces[monitor.active_workspace_idx];
+        self.global_workspace_idxs
+            .get(&active_workspace.id())
+            .copied()
+    }
+
+    fn previous_global_workspace_index_on_output(&mut self, output: &Output) -> Option<usize> {
+        self.refresh_global_workspace_indices();
+
+        let current = self.workspace_global_index_on_output(output)?;
+        let monitor = self.monitor_for_output(output)?;
+
+        monitor
+            .workspaces
+            .iter()
+            .filter_map(|ws| self.global_workspace_idxs.get(&ws.id()).copied())
+            .filter(|idx| *idx < current)
+            .max()
+    }
+
+    fn next_global_workspace_index_on_output(&mut self, output: &Output) -> Option<usize> {
+        self.refresh_global_workspace_indices();
+
+        let current = self.workspace_global_index_on_output(output)?;
+        let monitor = self.monitor_for_output(output)?;
+        let active_workspace = &monitor.workspaces[monitor.active_workspace_idx];
+
+        let next_existing = monitor
+            .workspaces
+            .iter()
+            .filter_map(|ws| self.global_workspace_idxs.get(&ws.id()).copied())
+            .filter(|idx| *idx > current)
+            .min();
+
+        next_existing.or_else(|| {
+            active_workspace
+                .has_windows_or_name()
+                .then(|| self.next_free_global_workspace_index_from(current + 1))
+        })
+    }
+
+    fn next_global_workspace_index_on_output_for_move(&mut self, output: &Output) -> Option<usize> {
+        self.refresh_global_workspace_indices();
+
+        let current = self.workspace_global_index_on_output(output)?;
+        let monitor = self.monitor_for_output(output)?;
+
+        let next_existing = monitor
+            .workspaces
+            .iter()
+            .filter_map(|ws| self.global_workspace_idxs.get(&ws.id()).copied())
+            .filter(|idx| *idx > current)
+            .min();
+
+        Some(
+            next_existing
+                .unwrap_or_else(|| self.next_free_global_workspace_index_from(current + 1)),
+        )
+    }
+
+    fn previous_global_workspace_index_on_output_for_move(
+        &mut self,
+        output: &Output,
+    ) -> Option<usize> {
+        self.refresh_global_workspace_indices();
+
+        let current = self.workspace_global_index_on_output(output)?;
+        let monitor = self.monitor_for_output(output)?;
+
+        // Prefer an existing lower-indexed workspace on this monitor; otherwise fall back
+        // to the largest free index below `current` (e.g. an index that was released by a
+        // previous move-down). Returns None when `current == 1` and nothing is free below.
+        let previous_existing = monitor
+            .workspaces
+            .iter()
+            .filter_map(|ws| self.global_workspace_idxs.get(&ws.id()).copied())
+            .filter(|idx| *idx < current)
+            .max();
+
+        previous_existing.or_else(|| self.previous_free_global_workspace_index_from(current))
+    }
+
+    fn previous_free_global_workspace_index_from(&self, start: usize) -> Option<usize> {
+        let used: HashSet<_> = self.global_workspace_idxs.values().copied().collect();
+
+        (1..start.max(1))
+            .rev()
+            .find(|candidate| !used.contains(candidate))
+    }
+
+    fn switch_workspace_to_global_index_on_output(&mut self, output: &Output, index: usize) {
+        let Some(workspace_idx) = self.ensure_global_workspace_by_index_on_output(output, index)
+        else {
+            return;
+        };
+        let Some(monitor) = self.monitor_for_output_mut(output) else {
+            return;
+        };
+        monitor.activate_workspace(workspace_idx);
+        self.refresh_global_workspace_indices();
+    }
+
+    /// Reassigns the global index of the active workspace on `output` to `index`. If
+    /// another workspace currently has `index`, their indices are swapped (which under
+    /// Invariant A means both will physically move to each other's positions after the
+    /// next sort). If no workspace has `index`, this is just a rename.
+    fn move_active_workspace_to_global_index_on_output(&mut self, output: &Output, index: usize) {
+        self.refresh_global_workspace_indices();
+
+        let Some((active_id, current_index)) =
+            self.monitor_for_output(output).and_then(|monitor| {
+                let workspace = &monitor.workspaces[monitor.active_workspace_idx];
+                self.global_workspace_idxs
+                    .get(&workspace.id())
+                    .copied()
+                    .map(|idx| (workspace.id(), idx))
+            })
+        else {
+            return;
+        };
+
+        if current_index == index {
+            return;
+        }
+
+        // Only swap with a workspace on the same monitor — a numeric collision with
+        // another monitor's workspace shouldn't drag that workspace across monitors.
+        let swap_with = self.monitor_for_output(output).and_then(|monitor| {
+            monitor.workspaces.iter().find_map(|ws| {
+                (self.global_workspace_idxs.get(&ws.id()).copied() == Some(index))
+                    .then_some(ws.id())
+            })
+        });
+
+        self.global_workspace_idxs.insert(active_id, index);
+        if let Some(other_id) = swap_with {
+            self.global_workspace_idxs.insert(other_id, current_index);
+        }
+
+        self.refresh_global_workspace_indices();
+    }
+
+    pub fn workspace_display_idx(&self, id: WorkspaceId, ws_idx: usize) -> Option<usize> {
+        if self.global_workspace_indices_enabled() {
+            self.global_workspace_idxs.get(&id).copied()
+        } else {
+            Some(ws_idx + 1)
+        }
+    }
+
     pub fn new(clock: Clock, config: &Config) -> Self {
         Self::with_options_and_workspaces(clock, config, Options::from_config(config))
     }
@@ -722,6 +1234,8 @@ impl<W: LayoutElement> Layout<W> {
             monitor_set: MonitorSet::NoOutputs { workspaces: vec![] },
             is_active: true,
             last_active_workspace_id: HashMap::new(),
+            global_workspace_idxs: HashMap::new(),
+            global_workspace_index_bases: HashMap::new(),
             interactive_move: None,
             dnd: None,
             clock,
@@ -747,6 +1261,8 @@ impl<W: LayoutElement> Layout<W> {
             monitor_set: MonitorSet::NoOutputs { workspaces },
             is_active: true,
             last_active_workspace_id: HashMap::new(),
+            global_workspace_idxs: HashMap::new(),
+            global_workspace_index_bases: HashMap::new(),
             interactive_move: None,
             dnd: None,
             clock,
@@ -872,7 +1388,9 @@ impl<W: LayoutElement> Layout<W> {
                     active_monitor_idx: 0,
                 }
             }
-        }
+        };
+
+        self.refresh_global_workspace_indices();
     }
 
     pub fn remove_output(&mut self, output: &Output) {
@@ -940,7 +1458,9 @@ impl<W: LayoutElement> Layout<W> {
             MonitorSet::NoOutputs { .. } => {
                 panic!("tried to remove output when there were already none")
             }
-        }
+        };
+
+        self.refresh_global_workspace_indices();
     }
 
     pub fn add_column_by_idx(
@@ -979,11 +1499,11 @@ impl<W: LayoutElement> Layout<W> {
         is_full_width: bool,
         is_floating: bool,
         activate: ActivateWindow,
-    ) -> Option<&Output> {
+    ) -> Option<Output> {
         let scrolling_height = height.map(SizeChange::from);
         let id = window.id().clone();
 
-        match &mut self.monitor_set {
+        let rv = match &mut self.monitor_set {
             MonitorSet::Normal {
                 monitors,
                 active_monitor_idx,
@@ -1073,7 +1593,7 @@ impl<W: LayoutElement> Layout<W> {
                     }
                 }
 
-                Some(&mon.output)
+                Some(mon.output.clone())
             }
             MonitorSet::NoOutputs { workspaces } => {
                 let (ws_idx, target) = match target {
@@ -1149,7 +1669,11 @@ impl<W: LayoutElement> Layout<W> {
 
                 None
             }
-        }
+        };
+
+        self.refresh_global_workspace_indices();
+
+        rv
     }
 
     pub fn remove_window(
@@ -1223,6 +1747,7 @@ impl<W: LayoutElement> Layout<W> {
                                 mon.workspaces.remove(1);
                                 mon.active_workspace_idx = 0;
                             }
+                            self.refresh_global_workspace_indices();
                             return Some(removed);
                         }
                     }
@@ -1238,6 +1763,7 @@ impl<W: LayoutElement> Layout<W> {
                             workspaces.remove(idx);
                         }
 
+                        self.refresh_global_workspace_indices();
                         return Some(removed);
                     }
                 }
@@ -1343,11 +1869,46 @@ impl<W: LayoutElement> Layout<W> {
         None
     }
 
+    pub fn find_output_and_workspace_index(
+        &mut self,
+        reference: WorkspaceReference,
+    ) -> Option<(Option<Output>, usize)> {
+        match reference {
+            WorkspaceReference::Index(index) if self.global_workspace_indices_enabled() => {
+                self.ensure_global_workspace_by_index(index.max(1) as usize)
+            }
+            WorkspaceReference::Index(index) => Some((None, index.saturating_sub(1) as usize)),
+            WorkspaceReference::Name(name) => {
+                let (target_workspace_index, target_workspace) =
+                    self.find_workspace_by_name(&name)?;
+                Some((
+                    target_workspace.current_output().cloned(),
+                    target_workspace_index,
+                ))
+            }
+            WorkspaceReference::Id(id) => {
+                let id = WorkspaceId::specific(id);
+                let (target_workspace_index, target_workspace) = self.find_workspace_by_id(id)?;
+                Some((
+                    target_workspace.current_output().cloned(),
+                    target_workspace_index,
+                ))
+            }
+        }
+    }
+
     pub fn find_workspace_by_ref(
         &mut self,
         reference: WorkspaceReference,
     ) -> Option<&mut Workspace<W>> {
         if let WorkspaceReference::Index(index) = reference {
+            if self.global_workspace_indices_enabled() {
+                let index = index.max(1) as usize;
+                self.ensure_global_workspace_by_index(index)?;
+                let (_, _, id) = self.find_workspace_by_global_index(index)?;
+                return self.workspaces_mut().find(|ws| ws.id() == id);
+            }
+
             self.active_monitor().and_then(|m| {
                 let index = index.saturating_sub(1) as usize;
                 m.workspaces.get_mut(index)
@@ -1380,6 +1941,7 @@ impl<W: LayoutElement> Layout<W> {
             MonitorSet::Normal { monitors, .. } => {
                 for mon in monitors {
                     if mon.unname_workspace(id) {
+                        self.refresh_global_workspace_indices();
                         return;
                     }
                 }
@@ -1394,6 +1956,7 @@ impl<W: LayoutElement> Layout<W> {
                             workspaces.remove(idx);
                         }
 
+                        self.refresh_global_workspace_indices();
                         return;
                     }
                 }
@@ -1595,6 +2158,7 @@ impl<W: LayoutElement> Layout<W> {
                         _ => mon.switch_workspace(workspace_idx),
                     }
 
+                    self.refresh_global_workspace_indices();
                     return;
                 }
             }
@@ -1631,6 +2195,7 @@ impl<W: LayoutElement> Layout<W> {
                         _ => mon.switch_workspace(workspace_idx),
                     }
 
+                    self.refresh_global_workspace_indices();
                     return;
                 }
             }
@@ -1914,17 +2479,31 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn move_down_or_to_workspace_down(&mut self) {
-        let Some(monitor) = self.active_monitor() else {
-            return;
+        let moved = {
+            let Some(workspace) = self.active_workspace_mut() else {
+                return;
+            };
+            workspace.move_down()
         };
-        monitor.move_down_or_to_workspace_down();
+        if moved {
+            return;
+        }
+
+        self.move_to_workspace_down(true);
     }
 
     pub fn move_up_or_to_workspace_up(&mut self) {
-        let Some(monitor) = self.active_monitor() else {
-            return;
+        let moved = {
+            let Some(workspace) = self.active_workspace_mut() else {
+                return;
+            };
+            workspace.move_up()
         };
-        monitor.move_up_or_to_workspace_up();
+        if moved {
+            return;
+        }
+
+        self.move_to_workspace_up(true);
     }
 
     pub fn consume_or_expel_window_left(&mut self, window: Option<&W::Id>) {
@@ -2116,17 +2695,31 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn focus_window_or_workspace_down(&mut self) {
-        let Some(monitor) = self.active_monitor() else {
-            return;
+        let focused = {
+            let Some(workspace) = self.active_workspace_mut() else {
+                return;
+            };
+            workspace.focus_down()
         };
-        monitor.focus_window_or_workspace_down();
+        if focused {
+            return;
+        }
+
+        self.switch_workspace_down();
     }
 
     pub fn focus_window_or_workspace_up(&mut self) {
-        let Some(monitor) = self.active_monitor() else {
-            return;
+        let focused = {
+            let Some(workspace) = self.active_workspace_mut() else {
+                return;
+            };
+            workspace.focus_up()
         };
-        monitor.focus_window_or_workspace_up();
+        if focused {
+            return;
+        }
+
+        self.switch_workspace_up();
     }
 
     pub fn focus_window_top(&mut self) {
@@ -2158,6 +2751,31 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn move_to_workspace_up(&mut self, focus: bool) {
+        if self.global_workspace_indices_enabled() {
+            let Some(output) = self.active_output().cloned() else {
+                return;
+            };
+            let Some(index) = self.previous_global_workspace_index_on_output_for_move(&output)
+            else {
+                return;
+            };
+            let Some(target_idx) = self.ensure_global_workspace_by_index_on_output(&output, index)
+            else {
+                return;
+            };
+            let Some(monitor) = self.active_monitor() else {
+                return;
+            };
+            let activate = if focus {
+                ActivateWindow::Yes
+            } else {
+                ActivateWindow::Smart
+            };
+            monitor.move_to_workspace(None, target_idx, activate);
+            self.refresh_global_workspace_indices();
+            return;
+        }
+
         let Some(monitor) = self.active_monitor() else {
             return;
         };
@@ -2167,9 +2785,34 @@ impl<W: LayoutElement> Layout<W> {
             ActivateWindow::No
         };
         monitor.move_to_workspace_up(activate);
+        self.refresh_global_workspace_indices();
     }
 
     pub fn move_to_workspace_down(&mut self, focus: bool) {
+        if self.global_workspace_indices_enabled() {
+            let Some(output) = self.active_output().cloned() else {
+                return;
+            };
+            let Some(index) = self.next_global_workspace_index_on_output_for_move(&output) else {
+                return;
+            };
+            let Some(target_idx) = self.ensure_global_workspace_by_index_on_output(&output, index)
+            else {
+                return;
+            };
+            let Some(monitor) = self.active_monitor() else {
+                return;
+            };
+            let activate = if focus {
+                ActivateWindow::Yes
+            } else {
+                ActivateWindow::Smart
+            };
+            monitor.move_to_workspace(None, target_idx, activate);
+            self.refresh_global_workspace_indices();
+            return;
+        }
+
         let Some(monitor) = self.active_monitor() else {
             return;
         };
@@ -2179,6 +2822,7 @@ impl<W: LayoutElement> Layout<W> {
             ActivateWindow::No
         };
         monitor.move_to_workspace_down(activate);
+        self.refresh_global_workspace_indices();
     }
 
     pub fn move_to_workspace(
@@ -2210,20 +2854,62 @@ impl<W: LayoutElement> Layout<W> {
             monitor
         };
         monitor.move_to_workspace(window, idx, activate);
+        self.refresh_global_workspace_indices();
     }
 
     pub fn move_column_to_workspace_up(&mut self, activate: bool) {
+        if self.global_workspace_indices_enabled() {
+            let Some(output) = self.active_output().cloned() else {
+                return;
+            };
+            let Some(index) = self.previous_global_workspace_index_on_output_for_move(&output)
+            else {
+                return;
+            };
+            let Some(target_idx) = self.ensure_global_workspace_by_index_on_output(&output, index)
+            else {
+                return;
+            };
+            let Some(monitor) = self.active_monitor() else {
+                return;
+            };
+            monitor.move_column_to_workspace(target_idx, activate);
+            self.refresh_global_workspace_indices();
+            return;
+        }
+
         let Some(monitor) = self.active_monitor() else {
             return;
         };
         monitor.move_column_to_workspace_up(activate);
+        self.refresh_global_workspace_indices();
     }
 
     pub fn move_column_to_workspace_down(&mut self, activate: bool) {
+        if self.global_workspace_indices_enabled() {
+            let Some(output) = self.active_output().cloned() else {
+                return;
+            };
+            let Some(index) = self.next_global_workspace_index_on_output_for_move(&output) else {
+                return;
+            };
+            let Some(target_idx) = self.ensure_global_workspace_by_index_on_output(&output, index)
+            else {
+                return;
+            };
+            let Some(monitor) = self.active_monitor() else {
+                return;
+            };
+            monitor.move_column_to_workspace(target_idx, activate);
+            self.refresh_global_workspace_indices();
+            return;
+        }
+
         let Some(monitor) = self.active_monitor() else {
             return;
         };
         monitor.move_column_to_workspace_down(activate);
+        self.refresh_global_workspace_indices();
     }
 
     pub fn move_column_to_workspace(&mut self, idx: usize, activate: bool) {
@@ -2231,20 +2917,77 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
         monitor.move_column_to_workspace(idx, activate);
+        self.refresh_global_workspace_indices();
     }
 
     pub fn switch_workspace_up(&mut self) {
+        if self.global_workspace_indices_enabled() {
+            let Some(output) = self.active_output().cloned() else {
+                return;
+            };
+            let Some(index) = self.previous_global_workspace_index_on_output(&output) else {
+                return;
+            };
+            self.switch_workspace_to_global_index_on_output(&output, index);
+            return;
+        }
+
         let Some(monitor) = self.active_monitor() else {
             return;
         };
         monitor.switch_workspace_up();
+        self.refresh_global_workspace_indices();
+    }
+
+    pub fn switch_workspace_up_on_output(&mut self, output: &Output) {
+        if self.global_workspace_indices_enabled() {
+            let Some(index) = self.previous_global_workspace_index_on_output(output) else {
+                return;
+            };
+            self.switch_workspace_to_global_index_on_output(output, index);
+            return;
+        }
+
+        let Some(monitor) = self.monitor_for_output_mut(output) else {
+            return;
+        };
+        monitor.switch_workspace_up();
+        self.refresh_global_workspace_indices();
     }
 
     pub fn switch_workspace_down(&mut self) {
+        if self.global_workspace_indices_enabled() {
+            let Some(output) = self.active_output().cloned() else {
+                return;
+            };
+            let Some(index) = self.next_global_workspace_index_on_output(&output) else {
+                return;
+            };
+            self.switch_workspace_to_global_index_on_output(&output, index);
+            return;
+        }
+
         let Some(monitor) = self.active_monitor() else {
             return;
         };
         monitor.switch_workspace_down();
+        self.refresh_global_workspace_indices();
+    }
+
+    pub fn switch_workspace_down_on_output(&mut self, output: &Output) {
+        if self.global_workspace_indices_enabled() {
+            let Some(index) = self.next_global_workspace_index_on_output(output) else {
+                return;
+            };
+            self.switch_workspace_to_global_index_on_output(output, index);
+            return;
+        }
+
+        let Some(monitor) = self.monitor_for_output_mut(output) else {
+            return;
+        };
+        monitor.switch_workspace_down();
+        self.refresh_global_workspace_indices();
     }
 
     pub fn switch_workspace(&mut self, idx: usize) {
@@ -2252,6 +2995,7 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
         monitor.switch_workspace(idx);
+        self.refresh_global_workspace_indices();
     }
 
     pub fn switch_workspace_auto_back_and_forth(&mut self, idx: usize) {
@@ -2259,6 +3003,7 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
         monitor.switch_workspace_auto_back_and_forth(idx);
+        self.refresh_global_workspace_indices();
     }
 
     pub fn switch_workspace_previous(&mut self) {
@@ -2266,6 +3011,7 @@ impl<W: LayoutElement> Layout<W> {
             return;
         };
         monitor.switch_workspace_previous();
+        self.refresh_global_workspace_indices();
     }
 
     pub fn consume_into_column(&mut self) {
@@ -2630,6 +3376,114 @@ impl<W: LayoutElement> Layout<W> {
                 saw_view_offset_gesture = has_view_offset_gesture;
             }
         }
+
+        self.verify_global_workspace_index_invariants();
+    }
+
+    /// Validates the invariants of `global_workspace_idxs`.
+    ///
+    /// When `global-workspace-indices` is disabled, the map must be empty.
+    ///
+    /// When enabled, all of the following must hold:
+    /// - Indices in the map are unique and >= 1.
+    /// - Every entry's workspace id is live.
+    /// - For workspaces on monitors *without* an in-flight `workspace_switch`: indexed workspaces
+    ///   are eligible, every eligible workspace is indexed, and indices ascend strictly with
+    ///   physical position (**Invariant A**).
+    ///
+    /// Workspaces on monitors with an in-flight `workspace_switch` are excluded from the
+    /// eligibility/order checks — refresh defers sorting and re-eligibility on those
+    /// monitors until the animation completes.
+    #[cfg(test)]
+    fn verify_global_workspace_index_invariants(&self) {
+        if !self.global_workspace_indices_enabled() {
+            assert!(
+                self.global_workspace_idxs.is_empty(),
+                "global_workspace_idxs must be empty when the feature is disabled"
+            );
+            return;
+        }
+
+        // Build (id -> eligible) and the set of ids on monitors with no in-flight switch
+        // (only these participate in eligibility checks).
+        let mut eligible_ids: HashMap<WorkspaceId, bool> = HashMap::new();
+        let mut stable_ids: HashSet<WorkspaceId> = HashSet::new();
+        match &self.monitor_set {
+            MonitorSet::Normal { monitors, .. } => {
+                for mon in monitors {
+                    let stable = mon.workspace_switch.is_none();
+                    for (ws_idx, ws) in mon.workspaces.iter().enumerate() {
+                        let eligible =
+                            ws.has_windows_or_name() || ws_idx == mon.active_workspace_idx;
+                        eligible_ids.insert(ws.id(), eligible);
+                        if stable {
+                            stable_ids.insert(ws.id());
+                        }
+                    }
+                }
+            }
+            MonitorSet::NoOutputs { workspaces } => {
+                for ws in workspaces {
+                    eligible_ids.insert(ws.id(), ws.has_windows_or_name());
+                    stable_ids.insert(ws.id());
+                }
+            }
+        }
+
+        // Indices must be unique and >= 1, and each must point at a live workspace.
+        // Eligibility is only enforced for workspaces on stable monitors.
+        let mut seen_indices: HashSet<usize> = HashSet::new();
+        for (&id, &idx) in &self.global_workspace_idxs {
+            assert!(idx >= 1, "global workspace indices must be >= 1, got {idx}");
+            assert!(
+                seen_indices.insert(idx),
+                "global workspace index {idx} is duplicated"
+            );
+            let Some(&eligible) = eligible_ids.get(&id) else {
+                panic!("global_workspace_idxs contains id {id:?} that no live workspace has");
+            };
+            if stable_ids.contains(&id) {
+                assert!(
+                    eligible,
+                    "global_workspace_idxs contains id {id:?} for an ineligible workspace \
+                     (empty unnamed inactive) on a monitor with no in-flight workspace_switch"
+                );
+            }
+        }
+
+        // Every eligible workspace on a stable monitor must have a global index.
+        for (id, eligible) in &eligible_ids {
+            if *eligible && stable_ids.contains(id) {
+                assert!(
+                    self.global_workspace_idxs.contains_key(id),
+                    "eligible workspace id {id:?} (on stable monitor) is missing a global index"
+                );
+            }
+        }
+
+        // Invariant A: per-monitor ascending order. Skip monitors with in-flight switches.
+        if let MonitorSet::Normal { monitors, .. } = &self.monitor_set {
+            for mon in monitors {
+                if mon.workspace_switch.is_some() {
+                    continue;
+                }
+                let mut last: Option<usize> = None;
+                for ws in &mon.workspaces {
+                    let Some(&idx) = self.global_workspace_idxs.get(&ws.id()) else {
+                        continue;
+                    };
+                    if let Some(prev) = last {
+                        assert!(
+                            idx > prev,
+                            "Invariant A violated on monitor {}: workspace order is not \
+                             strictly ascending by global index ({prev} before {idx})",
+                            mon.output_name(),
+                        );
+                    }
+                    last = Some(idx);
+                }
+            }
+        }
     }
 
     pub fn advance_animations(&mut self) {
@@ -2768,6 +3622,12 @@ impl<W: LayoutElement> Layout<W> {
                 }
             }
         }
+
+        // When a per-monitor workspace_switch completes during advance, the monitor runs
+        // its own clean_up_workspaces but doesn't refresh global indices. Refresh here so
+        // any deferred sort (skipped while the switch was in flight) and any newly
+        // ineligible workspace gets reflected in the map.
+        self.refresh_global_workspace_indices();
     }
 
     pub fn are_animations_ongoing(&self, output: Option<&Output>) -> bool {
@@ -2989,6 +3849,8 @@ impl<W: LayoutElement> Layout<W> {
                 workspaces.insert(0, ws);
             }
         }
+
+        self.refresh_global_workspace_indices();
     }
 
     pub fn update_config(&mut self, config: &Config) {
@@ -3030,6 +3892,10 @@ impl<W: LayoutElement> Layout<W> {
         }
 
         self.options = options;
+
+        // Picks up changes to `global-workspace-indices` (in particular, clearing the map
+        // when the feature flips off) and re-sorts monitors against the new options.
+        self.refresh_global_workspace_indices();
     }
 
     pub fn toggle_width(&mut self, forwards: bool) {
@@ -3426,6 +4292,8 @@ impl<W: LayoutElement> Layout<W> {
                 monitors[mon_idx].clean_up_workspaces();
             }
         }
+
+        self.refresh_global_workspace_indices();
     }
 
     pub fn move_column_to_output(
@@ -3462,6 +4330,8 @@ impl<W: LayoutElement> Layout<W> {
                 .min(monitors[new_idx].workspaces.len() - 1);
             self.add_column_by_idx(new_idx, workspace_idx, column, activate);
         }
+
+        self.refresh_global_workspace_indices();
     }
 
     pub fn move_workspace_to_output(&mut self, output: &Output) -> bool {
@@ -3535,6 +4405,8 @@ impl<W: LayoutElement> Layout<W> {
         if activate {
             *active_monitor_idx = target_idx;
         }
+
+        self.refresh_global_workspace_indices();
 
         activate
     }
@@ -3682,13 +4554,18 @@ impl<W: LayoutElement> Layout<W> {
             MonitorSet::NoOutputs { .. } => return None,
         };
 
+        let mut result = None;
         for monitor in monitors {
             if monitor.workspace_switch_gesture_end(is_touchpad) {
-                return Some(monitor.output.clone());
+                result = Some(monitor.output.clone());
+                break;
             }
         }
 
-        None
+        // The gesture-end may have ended (or kept) a workspace_switch and run
+        // clean_up_workspaces; refresh so the map and ordering reflect the new state.
+        self.refresh_global_workspace_indices();
+        result
     }
 
     pub fn view_offset_gesture_begin(
@@ -4388,6 +5265,8 @@ impl<W: LayoutElement> Layout<W> {
                 );
             }
         }
+
+        self.refresh_global_workspace_indices();
     }
 
     pub fn interactive_move_is_moving_above_output(&self, output: &Output) -> bool {
@@ -4432,6 +5311,8 @@ impl<W: LayoutElement> Layout<W> {
         for ws in self.workspaces_mut() {
             ws.dnd_scroll_gesture_end();
         }
+
+        self.refresh_global_workspace_indices();
     }
 
     pub fn interactive_resize_begin(&mut self, window: W::Id, edges: ResizeEdge) -> bool {
@@ -4520,17 +5401,42 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn move_workspace_down(&mut self) {
+        if self.global_workspace_indices_enabled() {
+            let Some(output) = self.active_output().cloned() else {
+                return;
+            };
+            let Some(index) = self.next_global_workspace_index_on_output_for_move(&output) else {
+                return;
+            };
+            self.move_active_workspace_to_global_index_on_output(&output, index);
+            return;
+        }
+
         let Some(monitor) = self.active_monitor() else {
             return;
         };
         monitor.move_workspace_down();
+        self.refresh_global_workspace_indices();
     }
 
     pub fn move_workspace_up(&mut self) {
+        if self.global_workspace_indices_enabled() {
+            let Some(output) = self.active_output().cloned() else {
+                return;
+            };
+            let Some(index) = self.previous_global_workspace_index_on_output_for_move(&output)
+            else {
+                return;
+            };
+            self.move_active_workspace_to_global_index_on_output(&output, index);
+            return;
+        }
+
         let Some(monitor) = self.active_monitor() else {
             return;
         };
         monitor.move_workspace_up();
+        self.refresh_global_workspace_indices();
     }
 
     pub fn move_workspace_to_idx(
@@ -4562,6 +5468,7 @@ impl<W: LayoutElement> Layout<W> {
         };
 
         monitor.move_workspace_to_idx(old_idx, new_idx);
+        self.refresh_global_workspace_indices();
     }
 
     pub fn set_workspace_name(&mut self, name: String, reference: Option<WorkspaceReference>) {
@@ -4612,6 +5519,8 @@ impl<W: LayoutElement> Layout<W> {
                 monitor.add_workspace_bottom();
             }
         }
+
+        self.refresh_global_workspace_indices();
     }
 
     pub fn unset_workspace_name(&mut self, reference: Option<WorkspaceReference>) {
@@ -4626,6 +5535,7 @@ impl<W: LayoutElement> Layout<W> {
         let id = ws.id();
 
         self.unname_workspace_by_id(id);
+        self.refresh_global_workspace_indices();
     }
 
     pub fn set_monitors_overview_state(&mut self) {

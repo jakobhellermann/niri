@@ -36,6 +36,7 @@ window-rule {
     match is-floating=true
     match is-window-cast-target=true
     match is-urgent=true
+    match is-fullscreen=true
     match at-startup=true
 
     // Properties that apply once upon window opening.
@@ -317,6 +318,23 @@ Matches windows that request the user's attention.
 ```kdl
 window-rule {
     match is-urgent=true
+}
+```
+
+#### `is-fullscreen`
+
+<sup>Since: 26.05</sup>
+
+Can be `true` or `false`.
+Matches windows that are currently fullscreen (i.e. niri has sent them the fullscreen state).
+
+This matcher is dynamic: rules are re-evaluated when a window enters or leaves fullscreen, so you can use it to apply different properties to fullscreen windows.
+
+```kdl
+// Make fullscreen windows fully opaque.
+window-rule {
+    match is-fullscreen=true
+    opacity 1.0
 }
 ```
 

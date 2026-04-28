@@ -2902,11 +2902,13 @@ impl State {
 
             if let Some(mapped) = self.niri.window_under_cursor() {
                 let window = mapped.window.clone();
+                let mod_actions_disabled =
+                    mapped.rules().disable_mod_mouse_actions == Some(true);
 
                 // Check if we need to start an interactive move.
                 if button == Some(MouseButton::Left) && !pointer.is_grabbed() {
                     let mod_down = modifiers_from_state(mods).contains(mod_key.to_modifiers());
-                    if is_overview_open || mod_down {
+                    if is_overview_open || (mod_down && !mod_actions_disabled) {
                         let location = pointer.current_location();
 
                         if !is_overview_open {
@@ -2941,7 +2943,7 @@ impl State {
                 // Check if we need to start an interactive resize.
                 else if button == Some(MouseButton::Right) && !pointer.is_grabbed() {
                     let mod_down = modifiers_from_state(mods).contains(mod_key.to_modifiers());
-                    if mod_down {
+                    if mod_down && !mod_actions_disabled {
                         let location = pointer.current_location();
                         let (output, pos_within_output) = self.niri.output_under(location).unwrap();
                         let edges = self
@@ -4175,8 +4177,13 @@ impl State {
             } else if let Some((window, _)) = under.window {
                 self.niri.layout.activate_window(&window);
 
+                let mod_actions_disabled = self
+                    .niri
+                    .window_under(pos)
+                    .is_some_and(|m| m.rules().disable_mod_mouse_actions == Some(true));
+
                 // Check if we need to start a touch move grab.
-                if mod_down {
+                if mod_down && !mod_actions_disabled {
                     let start_data = TouchGrabStartData {
                         focus: None,
                         slot,

@@ -907,12 +907,14 @@ mod tests {
                 match app-id=".*alacritty"
                 exclude title="~"
                 exclude is-active=true is-focused=false
+                exclude is-fullscreen=true
 
                 open-on-output "eDP-1"
                 open-maximized true
                 open-fullscreen false
                 open-floating false
                 open-focused true
+                disable-mod-mouse-actions true
                 default-window-height { fixed 500; }
                 default-column-display "tabbed"
                 default-floating-position x=100 y=-200 relative-to="bottom-left"
@@ -1768,6 +1770,7 @@ mod tests {
                             is_floating: None,
                             is_window_cast_target: None,
                             is_urgent: None,
+                            is_fullscreen: None,
                             at_startup: None,
                         },
                     ],
@@ -1787,6 +1790,7 @@ mod tests {
                             is_floating: None,
                             is_window_cast_target: None,
                             is_urgent: None,
+                            is_fullscreen: None,
                             at_startup: None,
                         },
                         Match {
@@ -1802,6 +1806,21 @@ mod tests {
                             is_floating: None,
                             is_window_cast_target: None,
                             is_urgent: None,
+                            is_fullscreen: None,
+                            at_startup: None,
+                        },
+                        Match {
+                            app_id: None,
+                            title: None,
+                            is_active: None,
+                            is_focused: None,
+                            is_active_in_column: None,
+                            is_floating: None,
+                            is_window_cast_target: None,
+                            is_urgent: None,
+                            is_fullscreen: Some(
+                                true,
+                            ),
                             at_startup: None,
                         },
                     ],
@@ -1917,6 +1936,9 @@ mod tests {
                     ),
                     scroll_factor: None,
                     tiled_state: None,
+                    disable_mod_mouse_actions: Some(
+                        true,
+                    ),
                     background_effect: BackgroundEffectRule {
                         xray: None,
                         blur: None,

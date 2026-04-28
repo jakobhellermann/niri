@@ -120,8 +120,15 @@ pub struct ResolvedWindowRules {
     /// Multiplier for all scroll events sent to this window.
     pub scroll_factor: Option<f64>,
 
+    /// Pinch gesture sensitivity for this window.
+    pub pinch_sensitivity: Option<f64>,
+
     /// Override whether to set the Tiled xdg-toplevel state on the window.
     pub tiled_state: Option<bool>,
+
+    /// Whether to disable Mod+Left Click drag for move
+    /// and Mod+Right Click Drag for resize for this window.
+    pub disable_mod_mouse_actions: Option<bool>,
 
     /// Background effect configuration.
     pub background_effect: BackgroundEffect,
@@ -306,8 +313,14 @@ impl ResolvedWindowRules {
                 if let Some(x) = rule.scroll_factor {
                     resolved.scroll_factor = Some(x.0);
                 }
+                if let Some(x) = rule.pinch_sensitivity {
+                    resolved.pinch_sensitivity = Some(x.0);
+                }
                 if let Some(x) = rule.tiled_state {
                     resolved.tiled_state = Some(x);
+                }
+                if let Some(x) = rule.disable_mod_mouse_actions {
+                    resolved.disable_mod_mouse_actions = Some(x);
                 }
 
                 resolved

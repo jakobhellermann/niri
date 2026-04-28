@@ -329,6 +329,32 @@ output "DP-2" {
 }
 ```
 
+### `global-workspace-index-base`
+
+Only meaningful when [`global-workspace-indices`](./Configuration:-Layout.md#global-workspace-indices) is enabled in the `layout {}` section.
+
+Sets the preferred starting global workspace index for this output. The first (typically empty) workspace on this output will be assigned this index instead of the default `n`-th-output-gets-`n` heuristic. Subsequent workspaces opened on this output (via `focus-workspace-down`, `move-window-to-workspace-down`, etc.) pick up from there.
+
+For example, with two outputs configured as below, the right monitor's workspaces are numbered 1, 2, 3, …, while the left monitor's workspaces are numbered 5, 6, 7, …:
+
+```kdl
+layout {
+    global-workspace-indices
+}
+
+output "DP-1" {
+    // right monitor — workspaces start at 1
+    global-workspace-index-base 1
+}
+
+output "DP-2" {
+    // left monitor — workspaces start at 5
+    global-workspace-index-base 5
+}
+```
+
+If two outputs are configured with the same base, only the first to be assigned gets that index; the other falls through to the next free index. A warning is logged.
+
 ### Layout config overrides
 
 <sup>Since: 25.11</sup>

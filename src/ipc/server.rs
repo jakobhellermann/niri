@@ -31,6 +31,7 @@ use smithay::utils::SERIAL_COUNTER;
 use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer};
 
 use crate::backend::IpcOutputMap;
+use crate::handlers::image_copy_capture;
 use crate::input::pick_window_grab::PickWindowGrab;
 use crate::layout::workspace::WorkspaceId;
 use crate::niri::State;
@@ -605,6 +606,9 @@ impl State {
         let mut need_workspaces_changed = false;
         for (mon, ws_idx, ws) in layout.workspaces() {
             let id = ws.id().get();
+            let Some(display_idx) = layout.workspace_display_idx(ws.id(), ws_idx) else {
+                continue;
+            };
             seen.insert(id);
 
             let Some(ipc_ws) = state.workspaces.get(&id) else {
@@ -615,7 +619,8 @@ impl State {
 
             // Check for any changes that we can't signal as individual events.
             let output_name = mon.map(|mon| mon.output_name());
-            if ipc_ws.idx != u8::try_from(ws_idx + 1).unwrap_or(u8::MAX)
+            let display_idx = u8::try_from(display_idx).unwrap_or(u8::MAX);
+            if ipc_ws.idx != display_idx
                 || ipc_ws.name.as_ref() != ws.name()
                 || ipc_ws.output.as_ref() != output_name
             {
@@ -661,18 +666,19 @@ impl State {
 
             let workspaces = layout
                 .workspaces()
-                .map(|(mon, ws_idx, ws)| {
+                .filter_map(|(mon, ws_idx, ws)| {
+                    let display_idx = layout.workspace_display_idx(ws.id(), ws_idx)?;
                     let id = ws.id().get();
-                    Workspace {
+                    Some(Workspace {
                         id,
-                        idx: u8::try_from(ws_idx + 1).unwrap_or(u8::MAX),
+                        idx: u8::try_from(display_idx).unwrap_or(u8::MAX),
                         name: ws.name().cloned(),
                         output: mon.map(|mon| mon.output_name().clone()),
                         is_urgent: ws.is_urgent(),
                         is_active: mon.is_some_and(|mon| mon.active_workspace_idx() == ws_idx),
                         is_focused: Some(id) == focused_ws_id,
                         active_window_id: ws.active_window().map(|win| win.id().get()),
-                    }
+                    })
                 })
                 .collect();
 
@@ -903,6 +909,46 @@ impl State {
                     };
                     events.push(Event::CastStartedOrChanged { cast });
                 }
+            }
+        }
+
+        // Check ext-image-copy-capture casts.
+        //
+        // Unlike wlr-screencopy, a session is an explicit protocol object, so
+        // the cast lifetime is tied to it. Dead sessions are already dropped by
+        // refresh_image_copy_capture(), which runs before this.
+        let output_sessions = self
+            .niri
+            .image_copy_sessions
+            .iter()
+            .map(|s| (s.session_id, s.stream_id, s.session.source(), s.credentials));
+        let cursor_sessions = self
+            .niri
+            .image_copy_cursor_sessions
+            .iter()
+            .map(|s| (s.session_id, s.stream_id, s.session.source(), s.credentials));
+        for (session_id, stream_id, source, credentials) in output_sessions.chain(cursor_sessions) {
+            let Some(output) = image_copy_capture::source_output(&source) else {
+                continue;
+            };
+
+            let stream_id = stream_id.get();
+            seen.insert(stream_id);
+
+            if !state.casts.contains_key(&stream_id) {
+                let cast = niri_ipc::Cast {
+                    session_id: session_id.get(),
+                    stream_id,
+                    kind: niri_ipc::CastKind::ExtImageCopyCapture,
+                    target: niri_ipc::CastTarget::Output {
+                        name: output.name(),
+                    },
+                    is_dynamic_target: false,
+                    is_active: true,
+                    pid: credentials.map(|creds| creds.pid),
+                    pw_node_id: None,
+                };
+                events.push(Event::CastStartedOrChanged { cast });
             }
         }
 

@@ -59,6 +59,7 @@ window-rule {
     default-column-display "tabbed"
     default-floating-position x=100 y=200 relative-to="bottom-left"
     scroll-factor 0.75
+    pinch-sensitivity 1.25
     on-xdg-activate "focus"
 
     focus-ring {
@@ -772,6 +773,23 @@ window-rule {
 }
 ```
 
+#### `pinch-sensitivity`
+
+<sup>Since: next release</sup>
+
+Set the sensitivity of pinch gestures sent to a window.
+
+This will be multiplied with the pinch sensitivity set for your touchpad in the [input section](./Configuration:-Input.md#pointing-devices).
+
+```kdl
+// Make pinch gestures in Firefox more sensitive.
+window-rule {
+    match app-id="firefox$"
+
+    pinch-sensitivity 1.25
+}
+```
+
 #### `draw-border-with-background`
 
 Override whether the border and the focus ring draw with a background.
@@ -971,6 +989,22 @@ window-rule {
 https://github.com/user-attachments/assets/3f4cb1a4-40b2-4766-98b7-eec014c19509
 
 </video>
+
+#### `disable-mod-mouse-actions`
+
+<sup>Since: next release</sup>
+
+Disables the niri-side <kbd>Mod</kbd>+<kbd>Left Mouse</kbd> interactive move and <kbd>Mod</kbd>+<kbd>Right Mouse</kbd> interactive resize for matching windows.
+Also disables the corresponding <kbd>Mod</kbd>+touch move grab.
+
+Useful for windows that want to handle <kbd>Mod</kbd>+click themselves, such as games or remote desktop clients.
+
+```kdl
+window-rule {
+    match app-id="^remote-desktop$"
+    disable-mod-mouse-actions true
+}
+```
 
 #### `background-effect`
 

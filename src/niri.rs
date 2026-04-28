@@ -139,7 +139,7 @@ use crate::ipc::server::IpcServer;
 use crate::layer::mapped::LayerSurfaceRenderElement;
 use crate::layer::MappedLayer;
 use crate::layout::tile::TileRenderElement;
-use crate::layout::workspace::{Workspace, WorkspaceId};
+use crate::layout::workspace::Workspace;
 use crate::layout::{
     HitType, Layout, LayoutElement as _, LayoutElementRenderElement, MonitorRenderElement,
 };
@@ -1770,6 +1770,8 @@ impl State {
                 }
             }
 
+            let global_workspace_index_base = config.and_then(|c| c.global_workspace_index_base);
+
             for mon in self.niri.layout.monitors_mut() {
                 if mon.output() != output {
                     continue;
@@ -1789,6 +1791,10 @@ impl State {
                 }
                 break;
             }
+
+            self.niri
+                .layout
+                .set_global_workspace_index_base(&output.name(), global_workspace_index_base);
         }
 
         for output in resized_outputs {
@@ -2839,6 +2845,7 @@ impl Niri {
                 layout.background_color = c.and_then(|c| c.background_color);
             }
         }
+        let global_workspace_index_base = c.and_then(|c| c.global_workspace_index_base);
         drop(config);
 
         // Set scale and transform before adding to the layout since that will read the output size.
@@ -2849,6 +2856,8 @@ impl Niri {
             None,
         );
 
+        self.layout
+            .set_global_workspace_index_base(&output.name(), global_workspace_index_base);
         self.layout.add_output(output.clone(), layout_config);
 
         let lock_render_state = if self.is_locked() {
@@ -3578,22 +3587,11 @@ impl Niri {
     }
 
     pub fn find_output_and_workspace_index(
-        &self,
+        &mut self,
         workspace_reference: WorkspaceReference,
     ) -> Option<(Option<Output>, usize)> {
-        let (target_workspace_index, target_workspace) = match workspace_reference {
-            WorkspaceReference::Index(index) => {
-                return Some((None, index.saturating_sub(1) as usize));
-            }
-            WorkspaceReference::Name(name) => self.layout.find_workspace_by_name(&name)?,
-            WorkspaceReference::Id(id) => {
-                let id = WorkspaceId::specific(id);
-                self.layout.find_workspace_by_id(id)?
-            }
-        };
-
-        let target_output = target_workspace.current_output();
-        Some((target_output.cloned(), target_workspace_index))
+        self.layout
+            .find_output_and_workspace_index(workspace_reference)
     }
 
     pub fn find_window_by_id(&self, id: MappedId) -> Option<Window> {

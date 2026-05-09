@@ -351,6 +351,10 @@ pub struct Layout<W: LayoutElement> {
     last_active_workspace_id: HashMap<String, WorkspaceId>,
     /// Optional global workspace indices for workspaces when the feature is enabled.
     global_workspace_idxs: HashMap<WorkspaceId, usize>,
+    /// Per-output preferred starting index for global workspace indices, keyed by output
+    /// connector name. Empty unless `global-workspace-indices` is enabled and the user has
+    /// configured `global-workspace-index-base` on at least one output.
+    global_workspace_index_bases: HashMap<String, usize>,
     /// Ongoing interactive move.
     interactive_move: Option<InteractiveMoveState<W>>,
     /// Ongoing drag-and-drop operation.
@@ -694,6 +698,39 @@ impl<W: LayoutElement> Layout<W> {
         self.options.layout.global_workspace_indices
     }
 
+    /// Sets the configured `global-workspace-index-base` for a single output. Pass `None` to
+    /// clear it.
+    pub fn set_global_workspace_index_base(&mut self, output_name: &str, base: Option<usize>) {
+        match base {
+            Some(base) => {
+                if base == 0 {
+                    warn!(
+                        "global-workspace-index-base on output {output_name} is 0; \
+                         using auto-assignment instead. Indices start at 1."
+                    );
+                    self.global_workspace_index_bases.remove(output_name);
+                    return;
+                }
+                if let Some((other, _)) = self
+                    .global_workspace_index_bases
+                    .iter()
+                    .find(|(other, b)| *other != output_name && **b == base)
+                {
+                    warn!(
+                        "global-workspace-index-base {base} on output {output_name} conflicts \
+                         with output {other}; the second to refresh will fall through to the \
+                         next free index"
+                    );
+                }
+                self.global_workspace_index_bases
+                    .insert(output_name.to_owned(), base);
+            }
+            None => {
+                self.global_workspace_index_bases.remove(output_name);
+            }
+        }
+    }
+
     fn pick_global_workspace_index(&self, preferred: Option<usize>) -> usize {
         let used: HashSet<_> = self.global_workspace_idxs.values().copied().collect();
 
@@ -737,13 +774,18 @@ impl<W: LayoutElement> Layout<W> {
         match &self.monitor_set {
             MonitorSet::Normal { monitors, .. } => {
                 for (mon_idx, mon) in monitors.iter().enumerate() {
+                    let preferred_active = self
+                        .global_workspace_index_bases
+                        .get(mon.output_name())
+                        .copied()
+                        .unwrap_or(mon_idx + 1);
                     for (ws_idx, ws) in mon.workspaces.iter().enumerate() {
                         if ws.has_windows_or_name() || ws_idx == mon.active_workspace_idx {
                             if let Some(index) = old_indices.get(&ws.id()).copied() {
                                 to_reassign.push((ws.id(), index));
                             } else {
                                 let preferred =
-                                    (ws_idx == mon.active_workspace_idx).then_some(mon_idx + 1);
+                                    (ws_idx == mon.active_workspace_idx).then_some(preferred_active);
                                 to_assign.push((ws.id(), preferred));
                             }
                         }
@@ -1038,6 +1080,7 @@ impl<W: LayoutElement> Layout<W> {
             is_active: true,
             last_active_workspace_id: HashMap::new(),
             global_workspace_idxs: HashMap::new(),
+            global_workspace_index_bases: HashMap::new(),
             interactive_move: None,
             dnd: None,
             clock,
@@ -1064,6 +1107,7 @@ impl<W: LayoutElement> Layout<W> {
             is_active: true,
             last_active_workspace_id: HashMap::new(),
             global_workspace_idxs: HashMap::new(),
+            global_workspace_index_bases: HashMap::new(),
             interactive_move: None,
             dnd: None,
             clock,

@@ -76,6 +76,8 @@ pub struct Output {
     pub hot_corners: Option<HotCorners>,
     #[knuffel(child)]
     pub layout: Option<LayoutPart>,
+    #[knuffel(child, unwrap(argument))]
+    pub global_workspace_index_base: Option<usize>,
 }
 
 impl Output {
@@ -108,6 +110,7 @@ impl Default for Output {
             backdrop_color: None,
             hot_corners: None,
             layout: None,
+            global_workspace_index_base: None,
         }
     }
 }

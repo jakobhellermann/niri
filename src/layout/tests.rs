@@ -2316,6 +2316,51 @@ fn global_workspace_indices_assign_unique_active_indices_per_output() {
 }
 
 #[test]
+fn global_workspace_indices_respect_configured_base() {
+    // output1 has base 1 (default-ish); output2 has base 5. With this configuration
+    // we expect output1 active=1 and output2 active=5, plus workspace-down on output2
+    // creating a workspace at index 6.
+    let mut layout = Layout::<TestWindow>::with_options(
+        Clock::with_time(Duration::ZERO),
+        options_with_global_workspace_indices(),
+    );
+    layout.set_global_workspace_index_base("output1", Some(1));
+    layout.set_global_workspace_index_base("output2", Some(5));
+    Op::AddOutput(1).apply(&mut layout);
+    Op::AddOutput(2).apply(&mut layout);
+
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let by_name = |name: &str| monitors.iter().find(|m| m.output_name() == name).unwrap();
+    let out1 = by_name("output1");
+    let out2 = by_name("output2");
+
+    assert_eq!(
+        layout.workspace_display_idx(
+            out1.workspaces[out1.active_workspace_idx].id(),
+            out1.active_workspace_idx
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        layout.workspace_display_idx(
+            out2.workspaces[out2.active_workspace_idx].id(),
+            out2.active_workspace_idx
+        ),
+        Some(5)
+    );
+
+    // Now focus output2 and move workspace-down: should land on global index 6.
+    let out2_output = out2.output().clone();
+    layout.focus_output(&out2_output);
+    let next = layout
+        .next_global_workspace_index_on_output_for_move(&out2_output)
+        .unwrap();
+    assert_eq!(next, 6);
+}
+
+#[test]
 fn global_workspace_indices_resolve_and_move_across_outputs() {
     let ops = [
         Op::AddOutput(1),

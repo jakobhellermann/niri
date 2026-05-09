@@ -759,6 +759,7 @@ mod tests {
 
             output "eDP-2" {
                 mode custom=true "1920x1080@144"
+                global-workspace-index-base 5
             }
 
             output "eDP-3" {
@@ -1204,6 +1205,7 @@ mod tests {
                             },
                         ),
                         layout: None,
+                        global_workspace_index_base: None,
                     },
                     Output {
                         off: false,
@@ -1231,6 +1233,9 @@ mod tests {
                         backdrop_color: None,
                         hot_corners: None,
                         layout: None,
+                        global_workspace_index_base: Some(
+                            5,
+                        ),
                     },
                     Output {
                         off: false,
@@ -1261,6 +1266,7 @@ mod tests {
                         backdrop_color: None,
                         hot_corners: None,
                         layout: None,
+                        global_workspace_index_base: None,
                     },
                 ],
             ),

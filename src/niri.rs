@@ -2064,6 +2064,8 @@ impl State {
                 }
             }
 
+            let global_workspace_index_base = config.and_then(|c| c.global_workspace_index_base);
+
             for mon in self.niri.layout.monitors_mut() {
                 if mon.output() != output {
                     continue;
@@ -2083,6 +2085,10 @@ impl State {
                 }
                 break;
             }
+
+            self.niri
+                .layout
+                .set_global_workspace_index_base(&output.name(), global_workspace_index_base);
         }
 
         for output in resized_outputs {
@@ -3198,6 +3204,7 @@ impl Niri {
                 layout.background_color = c.and_then(|c| c.background_color);
             }
         }
+        let global_workspace_index_base = c.and_then(|c| c.global_workspace_index_base);
         drop(config);
 
         // Set scale and transform before adding to the layout since that will read the output size.
@@ -3208,6 +3215,8 @@ impl Niri {
             None,
         );
 
+        self.layout
+            .set_global_workspace_index_base(&output.name(), global_workspace_index_base);
         self.layout.add_output(output.clone(), layout_config);
 
         let lock_render_state = if self.is_locked() {

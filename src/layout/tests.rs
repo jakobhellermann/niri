@@ -1664,6 +1664,7 @@ fn options_with_global_workspace_indices() -> Options {
     }
 }
 
+
 #[test]
 fn operations_dont_panic() {
     if std::env::var_os("RUN_SLOW_TESTS").is_none() {
@@ -2874,6 +2875,72 @@ fn global_workspace_indices_workspace_previous_stays_on_current_output() {
         ),
         Some(2)
     );
+}
+
+#[test]
+fn global_workspace_indices_focus_lower_index_inserts_above() {
+    // Regression for the move-window-to-workspace-5-while-on-#7 bug. Under Invariant A,
+    // requesting a global index lower than what currently exists on the monitor must
+    // insert the new workspace *above* the existing one physically — not just append at
+    // the bottom.
+    let ops = [
+        Op::AddOutput(1),
+        Op::AddWindow {
+            params: TestWindowParams::new(1),
+        },
+    ];
+
+    let mut layout = check_ops_with_options(options_with_global_workspace_indices(), ops);
+
+    // Focus-workspace 7 to create a workspace numbered 7 with the window.
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let output = monitors[0].output.clone();
+    let (out, idx) = layout
+        .find_output_and_workspace_index(WorkspaceReference::Index(7))
+        .unwrap();
+    assert_eq!(out.as_ref(), Some(&output));
+    layout.switch_workspace(idx);
+    // Move the window to #7 (which is now the active workspace; window is on #1).
+    // Easiest path: just request the move via Layout::move_to_workspace at the resolved idx.
+    let (_, idx_for_window) = layout
+        .find_output_and_workspace_index(WorkspaceReference::Index(7))
+        .unwrap();
+    layout.move_to_workspace(Some(&1), idx_for_window, ActivateWindow::Yes);
+
+    // Sanity: #7 now exists and holds the window.
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let mon = &monitors[0];
+    let seven_pos = mon
+        .workspaces
+        .iter()
+        .position(|ws| layout.workspace_display_idx(ws.id(), 0) == Some(7))
+        .expect("#7 must exist");
+    assert!(mon.workspaces[seven_pos].has_window(&1));
+
+    // Now request a lower global index #5. With the bug, this would append #5 *below*
+    // #7. With the fix, #5 must be inserted physically above #7.
+    let (_, five_idx) = layout
+        .find_output_and_workspace_index(WorkspaceReference::Index(5))
+        .unwrap();
+    let MonitorSet::Normal { monitors, .. } = &layout.monitor_set else {
+        unreachable!()
+    };
+    let mon = &monitors[0];
+    let five_id = mon.workspaces[five_idx].id();
+    assert_eq!(layout.workspace_display_idx(five_id, five_idx), Some(5));
+
+    // Invariant A: indexed workspaces appear in ascending order top-to-bottom.
+    let order: Vec<usize> = mon
+        .workspaces
+        .iter()
+        .enumerate()
+        .filter_map(|(i, ws)| layout.workspace_display_idx(ws.id(), i))
+        .collect();
+    assert_eq!(order, vec![5, 7]);
 }
 
 #[test]
@@ -4520,6 +4587,24 @@ proptest! {
         // eprintln!("{ops:?}");
         let options = Options {
             layout: niri_config::Layout::from_part(&layout_config),
+            ..Default::default()
+        };
+
+        check_ops_with_options(options, ops);
+    }
+
+    /// Same as `random_operations_dont_panic` but with `global-workspace-indices` enabled
+    /// throughout the run. `Layout::verify_invariants` enforces Invariant A and the global
+    /// index uniqueness/eligibility rules after every Op.
+    #[test]
+    fn random_operations_dont_panic_with_global_workspace_indices(
+        ops: Vec<Op>,
+        layout_config in arbitrary_layout_part(),
+    ) {
+        let mut layout = niri_config::Layout::from_part(&layout_config);
+        layout.global_workspace_indices = true;
+        let options = Options {
+            layout,
             ..Default::default()
         };
 

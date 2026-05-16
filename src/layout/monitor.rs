@@ -1,4 +1,5 @@
 use std::cmp::min;
+use std::collections::HashMap;
 use std::iter::zip;
 use std::rc::Rc;
 use std::time::Duration;
@@ -1340,6 +1341,46 @@ impl<W: LayoutElement> Monitor<W> {
         self.workspace_switch = None;
 
         self.clean_up_workspaces();
+    }
+
+    /// Reorders `self.workspaces` so indexed workspaces appear in ascending global-index
+    /// order, while keeping the pinned empty workspaces in place: the trailing empty at
+    /// `workspaces.len() - 1`, and, with `empty_workspace_above_first`, the leading empty at 0.
+    ///
+    /// Tracks the active workspace by id so `active_workspace_idx` follows its workspace to
+    /// the new position. Requires no in-flight workspace switch.
+    pub fn sort_workspaces_by_global_index(&mut self, indices: &HashMap<WorkspaceId, usize>) {
+        assert!(self.workspace_switch.is_none());
+
+        let len = self.workspaces.len();
+        if len < 2 {
+            return;
+        }
+
+        let head = if self.options.layout.empty_workspace_above_first {
+            1
+        } else {
+            0
+        };
+        let tail = len - 1;
+        if head >= tail {
+            return;
+        }
+
+        let active_id = self.workspaces[self.active_workspace_idx].id();
+
+        // Sort the middle range by (global index if present, else u32::MAX as a fallback so
+        // any unindexed workspace sinks to the bottom of the sortable range; this shouldn't
+        // happen after a refresh but we tolerate it). Use a stable sort so unindexed
+        // workspaces keep their relative order.
+        let middle = &mut self.workspaces[head..tail];
+        middle.sort_by_key(|ws| indices.get(&ws.id()).copied().unwrap_or(usize::MAX));
+
+        self.active_workspace_idx = self
+            .workspaces
+            .iter()
+            .position(|ws| ws.id() == active_id)
+            .expect("active workspace must still be in the vec after a sort");
     }
 
     /// Returns the geometry of the active window relative to and clamped to the output.
